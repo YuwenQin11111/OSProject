@@ -1,0 +1,343 @@
+
+			  Part II, Assignment 03
+			CSC401 - Operating Systems
+---------------------------------------------------------------------------------------
+					by Yuwen Qing (graduate, )
+				   	   Chao Li (graduate, chao.li@rochester.edu)
+
+
+
+To BE IMPROVED
+
+    * The lock doesn't allow multi-readers to read simutaneously.
+
+
+SOURCE FILES
+
+    * In kernel:
+	doevent.c, main.c, syscall_table_32.S,
+	doevent.h, unistd_32.h,
+	Makefile
+
+    * Test Files:
+	test_doevent.c
+
+
+COMPILE & RUN
+
+    * Kernel
+	# make -j4
+	# ../qemu/bin/qemu -m 200M -L ../qemu/share/qemu/ -hda ../hda.img 
+		-nographic -append "root=/dev/hda1 console=ttyS0,115200n8 
+		console=tty0" -kernel arch/i386/boot/bzImage
+
+    * Test program
+	# gcc -O0 test_doevent.c -o test_doevent
+	# ./test_doevent
+
+
+DESIGN
+   
+    1) Data strutures
+
+	The dsta structure of doevent is as below:
+	+-------------------------------------------------------------------------
+	| struct doevent {
+        | 	int                     eid;
+        | 	int                     count;
+        | 	spinlock_t              lock;           /* Lock for RW doevent */
+        | 	wait_queue_head_t       wait_queue;     /* Waiting process list */
+        | 	struct list_head        des;            /* Doevent list */
+	|};
+	+-------------------------------------------------------------------------
+
+	"eid" is the the id of doevent, "count" indidcate the number of processes
+	which are waiting the doevent. "lock" is used to synchronize reading or 
+	writing operation. The waiting processes are stored in "wait_queue". "des"
+	which is double link is used to link the doevents together, which help to
+	manage the list of doevent.
+
+	The data structure of list of doevent (de_list) is as below:	
+	+-------------------------------------------------------------------------
+	| struct doevent_list {
+        |	int             count;          /* Number of created doevent. */
+        |	struct doevent  * head;         /* First doevent. */
+        |	spinlock_t      lock;           /* write for RW de_list */
+	|};
+	+-------------------------------------------------------------------------
+	
+	"count" is used to count the number of doevents which have been opened in
+	kernel. "head" point to the first doevent. "lock" is used to synchronize
+	reading and writing operations on "de_list".
+
+    
+    2) Management of list of doevent
+	
+	Doevents are linked together to convienient the management of doevents. To
+	user's view, they can only see the id of doevent. While from the perspective
+	of kernel, it will translate the id of doevent to corresponing data structure
+	"doevent" by walking through the list of doevent. So a global of variable 
+	"de_list" is set to help to manage the list of doevents. "de_list" will be 
+	initialized when kernel starts. The "head" of "de_list" will point to NULL, 
+	and will point to the first doevent.
+
+	Each time when a doevent is opened, it will be added to the tail of the list
+	if it is not the first doevent.
+		+---------------------------------------------------------------
+		| list_add_tail(&de->des, &(de_list.head->des));
+		+---------------------------------------------------------------
+
+	When a doevent is going to be close, it will be removed from the list.
+		+---------------------------------------------------------------
+		| list_del(&de->des);
+		+---------------------------------------------------------------
+
+	Be carefull that if the removed doevent is the head of the list which 
+	"de_list->head" point to, "de_list->head" should point to the next of doevent.
+	If it's the last doevent, "de_list->head" should point to NULL again.
+		+----------------------------------------------------------------
+		| if (de->des.next == &de->des)
+                |	de_list.head = NULL;
+        	| else if (de_list.head == de)
+                |	de_list.head = list_entry(de->des.next, struct doevent, des);
+ 		+---------------------------------------------------------------
+			
+    3) Synchrobize reading/writing operation
+
+	Two locks are used to synchronize reader and writer. To avoid dead lock, 
+	reader/writer can't hold 2 locks simultaneously. To disable context switch
+	in critical section, the irq is disabled when hold lock. And will enable 
+	irq after release lock, so "spin_lock_irq()" and "spin_unlock_irq()" are used.
+
+	However, multi-readers are not allowed to read simutaneously.
+		
+    4) sys_doeventopen()
+
+	+---------+	 +------+      +------------+	   +---------+      +---------+
+	| create  | ---> |  get | ---> | initialize | ---> | add to  | ---> | release |
+	| doevent |	 | lock |      |  doevent   |	   | de_list |	    |   lock  |
+	+---------+	 +------+      +------------+	   +---------+	    +---------+
+
+    5) sys_doeventclose()
+
+	+------+      +---------+      +---------+      +-----------+	   +--------+	   +---------+
+	| get  | ---> |   find  | ---> | wake up | ---> |  delete   | ---> | free   | ---> | release |
+	| lock |      | doevent |      | process |	| from list |	   | memory |	   |  lock   |
+	+------+      +---------+      +---------+	+-----------+	   +--------+	   +---------+
+
+    7) sys_doeventwait()
+
+	+------+      +---------+      +----------+      +------------------+	   +---------+      +-------+
+	| get  | ---> |   find  | ---> | add to   | ---> |  chanage process | ---> | release | ---> | sched |
+	| lock |      | doevent |      | wait_que |	 |   statue         |	   |  lock   |	    |       |
+	+------+      +---------+      +----------+	 +------------------+	   +---------+	    +-------+
+
+    8) sys_doeventsig()
+
+	+------+      +---------+      +---------+      +---------+
+	| get  | ---> |   find  | ---> | wake up | ---> | release |
+	| lock |      | doevent |      | process |	|  lock   |
+	+------+      +---------+      +---------+	+---------+
+
+
+TEST
+
+    1) Test cases:
+
+	a. Test general operations on doevent
+	    STEP 1: Open 10 doevents.
+	    STEP 2: Signal & close the 10 doevent.
+	    STEP 3: Wait & signal & close again to verify error handling.
+
+	b. Test block and wakeup by "signal"
+	    STEP 1: Open 1 doevent.
+	    STEP 2: Fork 10 childs.
+	    STEP 3: Childs wait on the doevent.
+	    STEP 4: Parent signal the doevent.
+
+	c. Test block and wakeup by "close"
+	    STEP 1: Open 1 doevent.
+	    STEP 2: Fork 10 childs.
+	    STEP 3: Childs wait on the doevent.
+	    STEP 4: Parent close the doevent.
+
+	d. Test multi-process open doevent simutaneously
+	    STEP 1: Fork 10 childs.
+	    STEP 2: Each child open one doevent simutaneously.
+	    STEP 3: Each child close its doevent.
+
+	e. Test reblock on the same doevent
+	    STEP 1: Open 1 doevent.
+	    STEP 2: Fork 1 child.
+	    STEP 3: Child wait on the doevent.
+	    STEP 4: Parent signal the doevent.
+	    STEP 5: Fork another child.
+	    STEP 6: Child wait on the doevent.
+	    STEP 7: Parent signal the doevent.
+
+    2) Test results 
+	
+--------------------------------------------------------------------------------
+cs2456@cs2456:~/cs2456$ ./test_doevent
+---- test general operations ----
+Succeed to create event 1
+Succeed to create event 2
+Succeed to create event 3
+Succeed to create event 4
+Succeed to create event 5
+Succeed to create event 6
+Succeed to create event 7
+Succeed to create event 8
+Succeed to create event 9
+Succeed to create event 10
+Fail to wait event 1
+Fail to signal event 1
+Fail to close event 1
+Fail to wait event 2
+Fail to signal event 2
+Fail to close event 2
+Fail to wait event 3
+Fail to signal event 3
+Fail to close event 3
+Fail to wait event 4
+Fail to signal event 4
+Fail to close event 4
+Fail to wait event 5
+Fail to signal event 5
+Fail to close event 5
+Fail to wait event 6
+Fail to signal event 6
+Fail to close event 6
+Fail to wait event 7
+Fail to signal event 7
+Fail to close event 7
+Fail to wait event 8
+Fail to signal event 8
+Fail to close event 8
+Fail to wait event 9
+Fail to signal event 9
+Fail to close event 9
+Fail to wait event 10
+Fail to signal event 10
+Fail to close event 10
+
+Please entry andy key to continue ...
+
+---- test block and waitup by signal ----
+Parent open a doevent 11
+child 2248 try to get doevent 11
+[   67.999900] process 2248 try to get lock 11 ...
+child 2249 try to get doevent 11
+[   68.008690] process 2249 try to get lock 11 ...
+child 2250 try to get doevent 11
+[   68.010972] process 2250 try to get lock 11 ...
+child 2251 try to get doevent 11
+[   68.013735] process 2251 try to get lock 11 ...
+child 2252 try to get doevent 11
+[   68.016617] process 2252 try to get lock 11 ...
+child 2253 try to get doevent 11
+[   68.019190] process 2253 try to get lock 11 ...
+child 2254 try to get doevent 11
+[   68.022420] process 2254 try to get lock 11 ...
+child 2255 try to get doevent 11
+[   68.025102] process 2255 try to get lock 11 ...
+child 2256 try to get doevent 11
+[   68.027832] process 2256 try to get lock 11 ...
+child 2257 try to get doevent 11
+[   68.030603] process 2257 try to get lock 11 ...
+Parent will signal doevent ...
+[   73.036211] process 2251 back and get lock!
+child 2251 get doevent 11
+[   73.038682] process 2250 back and get lock!
+child 2250 get doevent 11
+[   73.040082] process 2252 back and get lock!
+child 2252 get doevent 11
+[   73.041280] process 2253 back and get lock!
+child 2253 get doevent 11
+[   73.042474] process 2249 back and get lock!
+child 2249 get doevent 11
+[   73.043786] process 2254 back and get lock!
+child 2254 get doevent 11
+[   73.048526] process 2255 back and get lock!
+child 2255 get doevent 11
+[   73.051082] process 2248 back and get lock!
+child 2248 get doevent 11
+[   73.053381] process 2256 back and get lock!
+child 2256 get doevent 11
+[   73.056087] process 2257 back and get lock!
+child 2257 get doevent 11
+signal number: 0
+Please entry andy key to continue ...
+
+---- test block and waitup by close ----
+Parent open a doevent 12
+child 2258 try to get doevent 12
+[   84.516073] process 2258 try to get lock 12 ...
+child 2259 try to get doevent 12
+[   84.519487] process 2259 try to get lock 12 ...
+child 2260 try to get doevent 12
+[   84.522914] process 2260 try to get lock 12 ...
+child 2261 try to get doevent 12
+[   84.525583] process 2261 try to get lock 12 ...
+child 2262 try to get doevent 12
+[   84.528308] process 2262 try to get lock 12 ...
+child 2263 try to get doevent 12
+[   84.532138] process 2263 try to get lock 12 ...
+child 2264 try to get doevent 12
+[   84.535386] process 2264 try to get lock 12 ...
+child 2265 try to get doevent 12
+[   84.538336] process 2265 try to get lock 12 ...
+child 2266 try to get doevent 12
+[   84.540976] process 2266 try to get lock 12 ...
+child 2267 try to get doevent 12
+[   84.543868] process 2267 try to get lock 12 ...
+Parent will close doevent ...
+[   89.548986] process 2261 back and get lock!
+child 2261 get doevent 12
+[   89.550259] process 2260 back and get lock!
+child 2260 get doevent 12
+[   89.551499] process 2262 back and get lock!
+child 2262 get doevent 12
+[   89.552833] process 2263 back and get lock!
+child 2263 get doevent 12
+[   89.554023] process 2259 back and get lock!
+child 2259 get doevent 12
+[   89.555217] process 2264 back and get lock!
+child 2264 get doevent 12
+[   89.558189] process 2265 back and get lock!
+child 2265 get doevent 12
+[   89.559777] process 2258 back and get lock!
+child 2258 get doevent 12
+[   89.564910] process 2266 back and get lock!
+child 2266 get doevent 12
+[   89.566680] process 2267 back and get lock!
+child 2267 get doevent 12
+signal number: 10
+Please entry andy key to continue ...
+
+---- test multi-processes open doevent simutaniously ----
+child 2268 open a de 13
+child 2269 open a de 14
+child 2270 open a de 15
+child 2271 open a de 16
+child 2272 open a de 17
+child 2273 open a de 18
+child 2274 open a de 19
+child 2275 open a de 20
+child 2276 open a de 21
+child 2277 open a de 22
+Please entry andy key to continue ...
+
+---- test reblock on the same doevent ----
+Parent open a doevent 23
+child 2278 try to get doevent 23
+[  190.561504] process 2278 try to get lock 23 ...
+parent signal doevent 23
+[  195.566347] process 2278 back and get lock!
+child 2278 get doevent 23
+child 2279 try to get doevent 23
+[  200.570067] process 2279 try to get lock 23 ...
+parent signal doevent 23
+[  205.575809] process 2279 back and get lock!
+child 2279 get doevent 23
+
